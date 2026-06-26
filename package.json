@@ -1,0 +1,32 @@
+{
+  "name": "@sgiq/apitracker",
+  "version": "0.1.0",
+  "description": "Tiny client for the API-Tracker ingest service — attribute LLM usage per app for cross-app billing.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc"
+  },
+  "keywords": [
+    "llm",
+    "usage",
+    "billing",
+    "anthropic",
+    "openai",
+    "apitracker"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "typescript": "^5.4.5"
+  }
+}
