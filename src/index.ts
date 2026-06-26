@@ -140,56 +140,69 @@ export interface TrackOptions extends TrackerConfig {
  * every other property/method passing through unchanged (via Proxy).
  * `path` is e.g. ['messages','create'] or ['chat','completions','create'].
  */
-function deepWrap<T extends object>(target: T, path: string[], wrap: (fn: Function) => Function): T {
+/** Navigate `path` and replace that node with `transform(node)`, passing every
+ *  other property through unchanged (via Proxy). */
+function deepReplace<T extends object>(target: T, path: string[], transform: (node: any) => any): T {
   const [head, ...rest] = path;
   return new Proxy(target, {
     get(t, prop, recv) {
       if (prop !== head) return Reflect.get(t, prop, recv);
       const child = (t as Record<string, unknown>)[head];
-      if (rest.length === 0) return wrap((child as Function).bind(t));
-      return deepWrap(child as object, rest, wrap);
+      return rest.length === 0 ? transform(child) : deepReplace(child as object, rest, transform);
     },
   }) as T;
 }
 
 function instrument<T extends object>(
   client: T,
-  path: string[],
+  containerPath: string[],
+  methods: string[],
   provider: Provider,
   normalize: (res: any) => TrackUsage,
   opts: TrackOptions,
 ): T {
-  const wrap = (orig: Function) =>
-    async function (this: unknown, ...args: unknown[]) {
-      const result = await (orig as (...a: unknown[]) => Promise<any>)(...args);
-      // Only auto-record non-streaming responses that carry a usage object.
-      if (result && typeof result === 'object' && 'usage' in result && (result as any).usage) {
-        record({
-          ...opts,
-          provider: opts.provider ?? provider,
-          model: (result as any).model ?? 'unknown',
-          usage: normalize(result),
-          requestId: (result as any).id ?? null,
-          metadata: opts.metadata,
-        });
-      }
-      return result;
-    };
-  return deepWrap(client, path, wrap);
+  // Proxy the method *container* (e.g. `messages` or `chat.completions`) so we can
+  // intercept several call methods on it (create, parse) while passing the rest through.
+  const wrapContainer = (container: any) =>
+    new Proxy(container, {
+      get(t, prop, recv) {
+        const orig = Reflect.get(t, prop, recv);
+        if (typeof orig !== 'function') return orig;
+        if (typeof prop === 'string' && methods.includes(prop)) {
+          return async (...args: unknown[]) => {
+            const result = await orig.apply(t, args);
+            // Only auto-record non-streaming responses that carry a usage object.
+            if (result && typeof result === 'object' && 'usage' in result && (result as any).usage) {
+              record({
+                ...opts,
+                provider: opts.provider ?? provider,
+                model: (result as any).model ?? 'unknown',
+                usage: normalize(result),
+                requestId: (result as any).id ?? null,
+                metadata: opts.metadata,
+              });
+            }
+            return result;
+          };
+        }
+        return orig.bind(t);
+      },
+    });
+  return deepReplace(client, containerPath, wrapContainer);
 }
 
-/** Wrap an Anthropic client so `messages.create` records usage automatically. */
+/** Wrap an Anthropic client so `messages.create` / `messages.parse` record usage. */
 export function trackAnthropic<T extends object>(client: T, opts: TrackOptions = {}): T {
-  return instrument(client, ['messages', 'create'], 'anthropic', (r) => fromAnthropic(r.usage), opts);
+  return instrument(client, ['messages'], ['create', 'parse'], 'anthropic', (r) => fromAnthropic(r.usage), opts);
 }
 
 /**
- * Wrap an OpenAI (or OpenAI-compatible) client so `chat.completions.create`
- * records usage automatically. Pass `{ provider: 'perplexity' }` for Perplexity.
+ * Wrap an OpenAI (or OpenAI-compatible) client so `chat.completions.create` and
+ * `chat.completions.parse` record usage. Pass `{ provider: 'perplexity' }` for Perplexity.
  */
 export function trackOpenAI<T extends object>(client: T, opts: TrackOptions = {}): T {
   const provider = opts.provider ?? 'openai';
-  return instrument(client, ['chat', 'completions', 'create'], provider, (r) => fromOpenAI(r.usage), opts);
+  return instrument(client, ['chat', 'completions'], ['create', 'parse'], provider, (r) => fromOpenAI(r.usage), opts);
 }
 
 /**
@@ -198,8 +211,11 @@ export function trackOpenAI<T extends object>(client: T, opts: TrackOptions = {}
  */
 export function track<T extends object>(client: T, opts: TrackOptions = {}): T {
   const c = client as any;
-  if (c?.messages && typeof c.messages.create === 'function') return trackAnthropic(client, opts);
-  if (c?.chat?.completions && typeof c.chat.completions.create === 'function') return trackOpenAI(client, opts);
+  const fn = (o: any) => typeof o === 'function';
+  if (c?.messages && (fn(c.messages.create) || fn(c.messages.parse))) return trackAnthropic(client, opts);
+  if (c?.chat?.completions && (fn(c.chat.completions.create) || fn(c.chat.completions.parse))) {
+    return trackOpenAI(client, opts);
+  }
   throw new Error(
     '@sgiq/apitracker: could not detect provider client. Use trackAnthropic() or trackOpenAI() explicitly.',
   );

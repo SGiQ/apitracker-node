@@ -47,8 +47,9 @@ const pplx = trackOpenAI(new OpenAI({ baseURL: 'https://api.perplexity.ai', apiK
 ```
 
 The wrappers proxy the real client — every other method/property passes through,
-so they're drop-in replacements. `app` must match the app your ingest key was
-issued for.
+so they're drop-in replacements. Both `create` **and** `parse` (the structured-output
+helpers, `messages.parse` / `chat.completions.parse`) are auto-recorded. `app` must
+match the app your ingest key was issued for.
 
 ### Streaming / manual
 
