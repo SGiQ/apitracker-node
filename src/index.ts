@@ -124,6 +124,24 @@ function fromOpenAI(u: OpenAIUsage | undefined): TrackUsage {
   };
 }
 
+interface GeminiUsage {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+  thoughtsTokenCount?: number;
+}
+
+function fromGemini(u: GeminiUsage | undefined): TrackUsage {
+  // promptTokenCount is cache-inclusive; Gemini bills thinking tokens as output.
+  const prompt = u?.promptTokenCount ?? 0;
+  const cached = Math.min(u?.cachedContentTokenCount ?? 0, prompt);
+  return {
+    inputTokens: Math.max(0, prompt - cached),
+    outputTokens: (u?.candidatesTokenCount ?? 0) + (u?.thoughtsTokenCount ?? 0),
+    cachedInputTokens: cached,
+  };
+}
+
 // ── Client wrappers ───────────────────────────────────────────────────────────
 
 export interface TrackOptions extends TrackerConfig {
@@ -153,6 +171,34 @@ function deepReplace<T extends object>(target: T, path: string[], transform: (no
   }) as T;
 }
 
+/** Proxy `container`, intercepting the named async methods to fire `onResult` after
+ *  each call. Every other property/method passes through unchanged. `onResult`
+ *  never throws into the caller — tracking must not break the underlying call. */
+function wrapMethods<T extends object>(
+  container: T,
+  methods: string[],
+  onResult: (result: any, args: unknown[]) => void,
+): T {
+  return new Proxy(container, {
+    get(t, prop, recv) {
+      const orig = Reflect.get(t, prop, recv);
+      if (typeof orig !== 'function') return orig;
+      if (typeof prop === 'string' && methods.includes(prop)) {
+        return async (...args: unknown[]) => {
+          const result = await orig.apply(t, args);
+          try {
+            onResult(result, args);
+          } catch {
+            /* tracking must never break the call */
+          }
+          return result;
+        };
+      }
+      return orig.bind(t);
+    },
+  }) as T;
+}
+
 function instrument<T extends object>(
   client: T,
   containerPath: string[],
@@ -161,34 +207,20 @@ function instrument<T extends object>(
   normalize: (res: any) => TrackUsage,
   opts: TrackOptions,
 ): T {
-  // Proxy the method *container* (e.g. `messages` or `chat.completions`) so we can
-  // intercept several call methods on it (create, parse) while passing the rest through.
-  const wrapContainer = (container: any) =>
-    new Proxy(container, {
-      get(t, prop, recv) {
-        const orig = Reflect.get(t, prop, recv);
-        if (typeof orig !== 'function') return orig;
-        if (typeof prop === 'string' && methods.includes(prop)) {
-          return async (...args: unknown[]) => {
-            const result = await orig.apply(t, args);
-            // Only auto-record non-streaming responses that carry a usage object.
-            if (result && typeof result === 'object' && 'usage' in result && (result as any).usage) {
-              record({
-                ...opts,
-                provider: opts.provider ?? provider,
-                model: (result as any).model ?? 'unknown',
-                usage: normalize(result),
-                requestId: (result as any).id ?? null,
-                metadata: opts.metadata,
-              });
-            }
-            return result;
-          };
-        }
-        return orig.bind(t);
-      },
-    });
-  return deepReplace(client, containerPath, wrapContainer);
+  const onResult = (result: any) => {
+    // Only auto-record non-streaming responses that carry a usage object.
+    if (result && typeof result === 'object' && 'usage' in result && result.usage) {
+      record({
+        ...opts,
+        provider: opts.provider ?? provider,
+        model: result.model ?? 'unknown',
+        usage: normalize(result),
+        requestId: result.id ?? null,
+        metadata: opts.metadata,
+      });
+    }
+  };
+  return deepReplace(client, containerPath, (container) => wrapMethods(container, methods, onResult));
 }
 
 /** Wrap an Anthropic client so `messages.create` / `messages.parse` record usage. */
@@ -206,8 +238,56 @@ export function trackOpenAI<T extends object>(client: T, opts: TrackOptions = {}
 }
 
 /**
- * Auto-detect the client type (Anthropic vs OpenAI) and wrap it. For Perplexity
- * or other OpenAI-compatible endpoints, use `trackOpenAI(client, { provider })`.
+ * Wrap a Google Gemini client. Supports both SDKs:
+ *   • new `@google/genai`:          `client.models.generateContent({ model, ... })`
+ *   • old `@google/generative-ai`:  `genAI.getGenerativeModel({ model }).generateContent(...)`
+ * Usage lives on `usageMetadata` (camelCase); the model id comes from the response
+ * (`modelVersion`) or the call/model args. Streaming is not auto-recorded.
+ */
+export function trackGemini<T extends object>(client: T, opts: TrackOptions = {}): T {
+  const c = client as any;
+  const provider: Provider = opts.provider ?? 'gemini';
+  const emit = (usageMeta: any, model: string, requestId: string | null) => {
+    if (usageMeta) {
+      record({ ...opts, provider, model: model || 'unknown', usage: fromGemini(usageMeta), requestId, metadata: opts.metadata });
+    }
+  };
+
+  // New @google/genai: client.models.generateContent(...) -> response w/ usageMetadata + modelVersion
+  if (c?.models && typeof c.models.generateContent === 'function') {
+    return deepReplace(client, ['models'], (models: any) =>
+      wrapMethods(models, ['generateContent'], (result: any, args: unknown[]) =>
+        emit(result?.usageMetadata, result?.modelVersion ?? (args?.[0] as any)?.model, result?.responseId ?? null),
+      ),
+    );
+  }
+
+  // Old @google/generative-ai: getGenerativeModel({ model }) -> model.generateContent() -> result.response.usageMetadata
+  if (typeof c?.getGenerativeModel === 'function') {
+    return new Proxy(client, {
+      get(t, prop, recv) {
+        if (prop !== 'getGenerativeModel') {
+          const v = Reflect.get(t, prop, recv);
+          return typeof v === 'function' ? v.bind(t) : v;
+        }
+        const orig = Reflect.get(t, prop, recv) as (...a: any[]) => any;
+        return (params: any, ...rest: any[]) => {
+          const modelId = params?.model ?? 'unknown';
+          const modelInstance = orig.apply(t, [params, ...rest]);
+          return wrapMethods(modelInstance, ['generateContent'], (result: any) =>
+            emit(result?.response?.usageMetadata, modelId, result?.response?.responseId ?? null),
+          );
+        };
+      },
+    }) as T;
+  }
+
+  throw new Error('@sgiq/apitracker: not a recognized Gemini client (need GoogleGenerativeAI or genai.Client).');
+}
+
+/**
+ * Auto-detect the client type (Anthropic / OpenAI / Gemini) and wrap it. For
+ * Perplexity or other OpenAI-compatible endpoints, use `trackOpenAI(client, { provider })`.
  */
 export function track<T extends object>(client: T, opts: TrackOptions = {}): T {
   const c = client as any;
@@ -216,7 +296,8 @@ export function track<T extends object>(client: T, opts: TrackOptions = {}): T {
   if (c?.chat?.completions && (fn(c.chat.completions.create) || fn(c.chat.completions.parse))) {
     return trackOpenAI(client, opts);
   }
+  if (fn(c?.getGenerativeModel) || (c?.models && fn(c.models.generateContent))) return trackGemini(client, opts);
   throw new Error(
-    '@sgiq/apitracker: could not detect provider client. Use trackAnthropic() or trackOpenAI() explicitly.',
+    '@sgiq/apitracker: could not detect provider client. Use trackAnthropic() / trackOpenAI() / trackGemini() explicitly.',
   );
 }

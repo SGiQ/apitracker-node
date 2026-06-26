@@ -73,10 +73,30 @@ record({
 });
 ```
 
+### Gemini
+
+Both Gemini SDKs are supported — `track()` auto-detects either:
+
+```ts
+// old @google/generative-ai
+import { GoogleGenerativeAI } from '@google/generative-ai';
+const genAI = track(new GoogleGenerativeAI(apiKey), { app: 'thematic-bot' });
+const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+await model.generateContent('hi');               // recorded
+
+// new @google/genai
+import { GoogleGenAI } from '@google/genai';
+const ai = track(new GoogleGenAI({ apiKey }), { app: 'thematic-bot' });
+await ai.models.generateContent({ model: 'gemini-2.5-pro', contents: 'hi' });   // recorded
+```
+
+Thinking tokens are billed as output; cached-content tokens are split out. Gemini
+streaming isn't auto-recorded — use `record()` for that.
+
 ## API
 
-- `track(client, opts)` — auto-detect Anthropic vs OpenAI and wrap.
-- `trackAnthropic(client, opts)` / `trackOpenAI(client, opts)` — explicit.
+- `track(client, opts)` — auto-detect Anthropic / OpenAI / Gemini and wrap.
+- `trackAnthropic` / `trackOpenAI` / `trackGemini` (client, opts) — explicit.
 - `record(args)` — post one event manually.
 
 `opts` / `args` accept `{ app, provider?, metadata?, url?, key?, timeoutMs?, onError? }`.
